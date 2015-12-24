@@ -1,8 +1,5 @@
 {Adapter,Robot,TextMessage,EnterMessage,LeaveMessage} = require 'hubot'
-
-XmppClient = require 'node-xmpp-client'
-JID = require('node-xmpp-core').JID
-ltx = require 'ltx'
+{JID, Stanza, Client, parse, Element} = require 'node-xmpp-client'
 util = require 'util'
 
 class XmppBot extends Adapter
@@ -19,6 +16,9 @@ class XmppBot extends Adapter
     # Key is the room JID, value is the private JID
     @roomToPrivateJID = {}
 
+    # http://stackoverflow.com/a/646643
+    String::startsWith ?= (s) -> @slice(0, s.length) == s
+
   run: ->
     options =
       username: process.env.HUBOT_XMPP_USERNAME
@@ -27,10 +27,13 @@ class XmppBot extends Adapter
       port: process.env.HUBOT_XMPP_PORT
       rooms: @parseRooms process.env.HUBOT_XMPP_ROOMS.split(',')
       # ms interval to send whitespace to xmpp server
-      keepaliveInterval: 30000
+      keepaliveInterval: process.env.HUBOT_XMPP_KEEPALIVE_INTERVAL || 30000
+      reconnectTry: process.env.HUBOT_XMPP_RECONNECT_TRY || 5
+      reconnectWait: process.env.HUBOT_XMPP_RECONNECT_WAIT || 5000
       legacySSL: process.env.HUBOT_XMPP_LEGACYSSL
       preferredSaslMechanism: process.env.HUBOT_XMPP_PREFERRED_SASL_MECHANISM
       disallowTLS: process.env.HUBOT_XMPP_DISALLOW_TLS
+      pmAddPrefix: process.env.HUBOT_XMPP_PM_ADD_PREFIX
 
     @robot.logger.info util.inspect(options)
     options.password = process.env.HUBOT_XMPP_PASSWORD
@@ -41,8 +44,10 @@ class XmppBot extends Adapter
 
   # Only try to reconnect 5 times
   reconnect: () ->
+    options = @options
+
     @reconnectTryCount += 1
-    if @reconnectTryCount > 100
+    if @reconnectTryCount > options.reconnectTry
       @robot.logger.error 'Unable to reconnect to jabber server dying.'
       process.exit 1
 
@@ -53,12 +58,12 @@ class XmppBot extends Adapter
 
     setTimeout () =>
       @makeClient()
-    , 10000
+    , options.reconnectWait
 
   makeClient: () ->
     options = @options
 
-    @client = new XmppClient
+    @client = new Client
       reconnect: true
       jid: options.username
       password: options.password
@@ -92,7 +97,7 @@ class XmppBot extends Adapter
     @client.connection.socket.setTimeout 0
     @client.connection.socket.setKeepAlive true, @options.keepaliveInterval
 
-    presence = new ltx.Element 'presence'
+    presence = new Stanza 'presence'
     presence.c('nick', xmlns: 'http://jabber.org/protocol/nick').t(@robot.name)
     @client.send presence
     @robot.logger.info 'Hubot XMPP sent initial presence'
@@ -104,7 +109,7 @@ class XmppBot extends Adapter
     @reconnectTryCount = 0
 
   ping: =>
-    ping = new ltx.Element('iq', type: 'get')
+    ping = new Stanza('iq', type: 'get')
     ping.c('ping', xmlns: 'urn:xmpp:ping')
 
     @robot.logger.debug "[sending ping] #{ping}"
@@ -127,7 +132,7 @@ class XmppBot extends Adapter
       # prevent the server from confusing us with old messages
       # and it seems that servers don't reliably support maxchars
       # or zero values
-      el = new ltx.Element('presence', to: "#{room.jid}/#{@robot.name}")
+      el = new Stanza('presence', to: "#{room.jid}/#{@robot.name}")
       x = el.c('x', xmlns: 'http://jabber.org/protocol/muc')
       x.c('history', seconds: 1 )
 
@@ -145,9 +150,47 @@ class XmppBot extends Adapter
     @client.send do =>
       @robot.logger.debug "Leaving #{room.jid}/#{@robot.name}"
 
-      return new ltx.Element('presence',
+      return new Stanza('presence',
         to: "#{room.jid}/#{@robot.name}",
         type: 'unavailable')
+
+  # Send query for users in the room and once the server response is parsed,
+  # apply the callback against the retrieved data.
+  # callback should be of the form `(usersInRoom) -> console.log usersInRoom`
+  # where usersInRoom is an array of username strings.
+  # For normal use, no need to pass requestId: it's there for testing purposes.
+  getUsersInRoom: (room, callback, requestId) ->
+    # (pseudo) random string to keep track of the current request
+    # Useful in case of concurrent requests
+    unless requestId
+      requestId = 'get_users_in_room_' + Date.now() + Math.random().toString(36).slice(2)
+
+    # http://xmpp.org/extensions/xep-0045.html#disco-roomitems
+    @client.send do =>
+      @robot.logger.debug "Fetching users in the room #{room.jid}"
+      message = new Stanza('iq',
+        from : @options.username,
+        id: requestId,
+        to : room.jid,
+        type: 'get')
+      message.c('query',
+        xmlns : 'http://jabber.org/protocol/disco#items')
+      return message
+
+    # Listen to the event with the current request id, one time only
+    @once "completedRequest#{requestId}", callback
+
+  # XMPP invite to a room, directly - http://xmpp.org/extensions/xep-0249.html
+  sendInvite: (room, invitee, reason) ->
+    @client.send do =>
+      @robot.logger.debug "Inviting #{invitee} to #{room.jid}"
+      message = new Stanza('message',
+        to : invitee)
+      message.c('x',
+        xmlns : 'jabber:x:conference',
+        jid: room.jid,
+        reason: reason)
+      return message
 
   read: (stanza) =>
     if stanza.attrs.type is 'error'
@@ -168,7 +211,7 @@ class XmppBot extends Adapter
     # Some servers use iq pings to make sure the client is still functional.
     # We need to reply or we'll get kicked out of rooms we've joined.
     if (stanza.attrs.type == 'get' && stanza.children[0].name == 'ping')
-      pong = new ltx.Element('iq',
+      pong = new Stanza('iq',
         to: stanza.attrs.from
         from: stanza.attrs.to
         type: 'result'
@@ -176,6 +219,15 @@ class XmppBot extends Adapter
 
       @robot.logger.debug "[sending pong] #{pong}"
       @client.send pong
+    else if ((stanza.attrs.id?.startsWith 'get_users_in_room') && stanza.children[0].children)
+      roomJID = stanza.attrs.from
+      userItems = stanza.children[0].children
+
+      # Note that this contains usernames and NOT the full user JID.
+      usersInRoom = (item.attrs.name for item in userItems)
+      @robot.logger.debug "[users in room] #{roomJID} has #{usersInRoom}"
+
+      @emit "completedRequest#{stanza.attrs.id}", usersInRoom
 
   readMessage: (stanza) =>
     # ignore non-messages
@@ -208,6 +260,11 @@ class XmppBot extends Adapter
       room = undefined
       # Also store the private JID so we can use it in the send method
       privateChatJID = from
+      # For private messages, make the commands work even when they are not prefixed with hubot name or alias
+      if @options.pmAddPrefix and
+          message.slice(0, @robot.name.length).toLowerCase() != @robot.name.toLowerCase() and
+          message.slice(0, process.env.HUBOT_ALIAS?.length).toLowerCase() != process.env.HUBOT_ALIAS?.toLowerCase()
+        message = "#{@robot.name} #{message}"
 
     # note that 'user' isn't a full JID in case of group chat,
     # just the local user part
@@ -237,7 +294,7 @@ class XmppBot extends Adapter
       when 'subscribe'
         @robot.logger.debug "#{stanza.attrs.from} subscribed to me"
 
-        @client.send new ltx.Element('presence',
+        @client.send new Stanza('presence',
             from: stanza.attrs.to
             to:   stanza.attrs.from
             id:   stanza.attrs.id
@@ -246,7 +303,7 @@ class XmppBot extends Adapter
       when 'probe'
         @robot.logger.debug "#{stanza.attrs.from} probed me"
 
-        @client.send new ltx.Element('presence',
+        @client.send new Stanza('presence',
             from: stanza.attrs.to
             to:   stanza.attrs.from
             id:   stanza.attrs.id
@@ -345,14 +402,13 @@ class XmppBot extends Adapter
         id: Math.random().toString(32).slice(2)
         type: envelope.user?.type or 'groupchat'
 
-      # ltx.Element type
-      if msg.attrs?
+      if msg instanceof Element
         message = msg.root()
         message.attrs.to ?= params.to
         message.attrs.type ?= params.type
       else
-        parsedMsg = try new ltx.parse(msg)
-        bodyMsg   = new ltx.Element('message', params).
+        parsedMsg = try parse(msg)
+        bodyMsg   = new Stanza('message', params).
                     c('body').t(msg)
         message   = if parsedMsg?
                       bodyMsg.up().
@@ -366,8 +422,7 @@ class XmppBot extends Adapter
 
   reply: (envelope, messages...) ->
     for msg in messages
-      # ltx.Element?
-      if msg.attrs?
+      if msg instanceof Element
         @send envelope, msg
       else
         @send envelope, "#{envelope.user.name}: #{msg}"
@@ -375,7 +430,7 @@ class XmppBot extends Adapter
   topic: (envelope, strings...) ->
     string = strings.join "\n"
 
-    message = new ltx.Element('message',
+    message = new Stanza('message',
                 to: envelope.room
                 type: envelope.user.type
               ).
